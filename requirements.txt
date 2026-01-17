@@ -1,0 +1,6 @@
+alpaca-py
+pandas
+numpy
+requests
+schedule
+lxml
