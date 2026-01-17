@@ -8,12 +8,13 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -23,15 +24,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Screener Once
+      # ---- DIAGNOSTIC STEP (SAFE) ----
+      # Confirms secrets exist without revealing them
+      - name: Confirm Alpaca secrets are injected
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+        run: |
+          python - << 'PY'
+          import os
+          print("APCA_API_KEY_ID present:", bool(os.getenv("APCA_API_KEY_ID")))
+          print("APCA_API_SECRET_KEY present:", bool(os.getenv("APCA_API_SECRET_KEY")))
+          PY
 
+      # ---- MAIN RUN ----
+      - name: Run Alpaca Screener (single scan)
+        env:
+          # Alpaca (REQUIRED)
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+
+          # Email (OPTIONAL)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+
+          # SMS (OPTIONAL)
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          TWILIO_TO: ${{ secrets.TWILIO_TO }}
+
         run: |
           python alpaca_hourly_screener.py --once
