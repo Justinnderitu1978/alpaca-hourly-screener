@@ -1,40 +1,33 @@
 #!/usr/bin/env python3
 """
-alpaca_hourly_screener.py
+alpaca_hourly_screener.py (ALPACA universe + IEX feed + ALWAYS emails a list)
 
-Hourly intraday screener using Alpaca market data (NO Wikipedia):
+What it does
+- Runs every hour (or once with --once)
+- Universe: ALL tradable US equities from Alpaca assets (NO Wikipedia)
+- Best-effort excludes ETFs using asset name hints + symbol suffix filters
+- Pulls 1H bars from Alpaca (forces IEX feed for Alpaca Free)
+- Computes: EMA20/EMA50, RSI14, MACD histogram, rolling VWAP, ATR14, vol ratio
+- Generates alerts:
+    * BREAKOUT
+    * TREND_PULLBACK
+    * MEAN_REVERSION_UP
+- ALWAYS sends an email summary:
+    * Alert list (if any)
+    * Top 25 ranked candidates (even if 0 alerts)
+- Logs alerts to CSV
 
-Universe:
-- All tradable US equities from Alpaca assets
-- Best-effort ETF exclusion using asset name hints + symbol suffix filters
+Required env vars (GitHub secrets):
+  APCA_API_KEY_ID
+  APCA_API_SECRET_KEY
 
-Data:
-- 1H bars from Alpaca
-- Alpaca Free: forces IEX feed
+Email env vars (GitHub secrets) to receive summaries:
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_TO_EMAIL
 
-Indicators (1H):
-- Trend: EMA20 / EMA50 + price location
-- Momentum: RSI14 + MACD histogram
-- Breakout: near prior highs + volume ratio
-- Mean reversion: distance from rolling VWAP + reversal candle
-- Risk: ATR14
+Optional Twilio env vars:
+  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, TWILIO_TO
 
-Alerts:
-- BREAKOUT (near/breaking lookback high + volume)
-- TREND_PULLBACK (uptrend + near EMA20 + momentum)
-- MEAN_REVERSION_UP (below VWAP + reversal)
-
-Outputs:
-- Prints alerts
-- Appends to CSV
-- Emails a summary if alerts exist
-- Optional SMS via Twilio (if env vars present)
-
-Run:
-- Local loop: python alpaca_hourly_screener.py
-- Cloud scheduled: python alpaca_hourly_screener.py --once
-
-DISCLAIMER: Informational alerts only. Not financial advice.
+DISCLAIMER: Informational only. Not financial advice.
 """
 
 from __future__ import annotations
@@ -67,18 +60,22 @@ from alpaca.trading.enums import AssetClass
 # ---------------------------
 
 CONFIG = {
-    # scan
+    # Scan settings
     "scan_interval_minutes": 60,
     "bars_timeframe": TimeFrame.Hour,
-    "bars_limit": 600,                 # ~25 days of 1H bars
-    "max_symbols_per_run": 1200,        # safety cap for GitHub Actions runtime
+    "bars_limit": 600,              # ~25 days of 1H bars
+    "min_bars_required": 140,       # enough for indicators + lookbacks
 
-    # basic filters
+    # Universe/runtime safety
+    "max_symbols_per_run": 1200,    # reduce/increase depending on runtime
+    "throttle_every": 200,
+    "throttle_sleep": 0.5,
+
+    # Filters
     "min_price": 10.0,
-    "min_avg_dollar_vol_20h": 5_000_000,  # avg(volume * close) over last 20 1H bars
-    "min_bars_required": 120,            # minimum bars to compute signals reliably
+    "min_avg_dollar_vol_20h": 5_000_000,  # avg(volume*close) last 20 hourly bars
 
-    # indicators
+    # Trend/Momentum
     "ema_fast": 20,
     "ema_slow": 50,
     "rsi_period": 14,
@@ -86,28 +83,29 @@ CONFIG = {
     "rsi_max": 75,
     "require_macd_hist_positive": True,
 
-    # breakout
+    # Breakout logic
     "breakout_lookback_hours": 40,
-    "breakout_near_pct": 0.003,          # within 0.3% of prior high counts as "near"
-    "breakout_buffer_pct": 0.001,        # trigger slightly above prior high
-    "volume_ratio_min": 1.3,             # last volume / 20h vol MA
+    "breakout_near_pct": 0.003,     # within 0.3% of prior high = "near"
+    "breakout_buffer_pct": 0.001,   # trigger just above prior high
+    "volume_ratio_min": 1.3,        # last vol / vol_ma20
 
-    # pullback
-    "pullback_near_ema_pct": 0.005,      # within 0.5% of EMA20
+    # Pullback logic
+    "pullback_near_ema_pct": 0.005, # within 0.5% of EMA20
     "require_green_candle": True,
 
-    # mean reversion
+    # Mean reversion logic
     "vwap_lookback_hours": 30,
-    "vwap_far_pct": 0.015,               # 1.5% below VWAP
-    "reversal_wick_ratio_min": 1.2,      # lower wick / body >= 1.2
+    "vwap_far_pct": 0.015,          # 1.5% below VWAP
+    "reversal_wick_ratio_min": 1.2, # lower wick/body
 
-    # target & risk
-    "target_pct": 0.10,                  # +10% target
+    # Target / Risk (informational)
+    "target_pct": 0.10,             # +10% target
     "atr_period": 14,
     "stop_atr_mult": 1.5,
 
-    # output
+    # Output
     "alerts_csv": "alerts_log.csv",
+    "top_candidates_n": 25,
 }
 
 
@@ -156,12 +154,13 @@ def wick_body_ratios(row: pd.Series) -> Tuple[float, float]:
 # Email / SMS
 # ---------------------------
 
-def send_email(subject: str, body: str):
+def send_email(subject: str, body: str) -> None:
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
     pwd = os.getenv("SMTP_PASS")
     to_email = os.getenv("ALERT_TO_EMAIL")
+
     if not all([host, user, pwd, to_email]):
         print("Email skipped (SMTP secrets missing).")
         return
@@ -176,7 +175,7 @@ def send_email(subject: str, body: str):
         s.login(user, pwd)
         s.sendmail(user, [to_email], msg.as_string())
 
-def send_sms_twilio(body: str):
+def send_sms_twilio(body: str) -> None:
     sid = os.getenv("TWILIO_ACCOUNT_SID")
     token = os.getenv("TWILIO_AUTH_TOKEN")
     from_ = os.getenv("TWILIO_FROM")
@@ -193,7 +192,7 @@ def send_sms_twilio(body: str):
 # CSV logging
 # ---------------------------
 
-def append_alerts_csv(alerts: List[Dict], path: str):
+def append_alerts_csv(alerts: List[Dict], path: str) -> None:
     if not alerts:
         return
     df = pd.DataFrame(alerts)
@@ -211,12 +210,12 @@ def make_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
     if not key or not secret:
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY secrets.")
     data_client = StockHistoricalDataClient(key, secret)
-    trading_client = TradingClient(key, secret, paper=True)
+    trading_client = TradingClient(key, secret, paper=True)  # use paper keys
     return data_client, trading_client
 
 
 # ---------------------------
-# Universe: Alpaca assets (no Wikipedia)
+# Universe: Alpaca assets
 # ---------------------------
 
 ETF_NAME_HINTS = [
@@ -259,12 +258,9 @@ def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
         universe.append(sym)
 
     universe = sorted(set(universe))
-
-    # cap for runtime safety in GitHub Actions
-    cap = int(CONFIG.get("max_symbols_per_run") or 0)
+    cap = int(CONFIG["max_symbols_per_run"] or 0)
     if cap > 0 and len(universe) > cap:
         universe = universe[:cap]
-
     return universe
 
 
@@ -302,13 +298,71 @@ def get_hourly_bars(data_client: StockHistoricalDataClient, symbol: str) -> Opti
 
 
 # ---------------------------
+# Candidate scoring (for always-on email list)
+# ---------------------------
+
+def score_candidate(df: pd.DataFrame) -> Optional[Dict]:
+    if df is None or df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+
+    ema20_v = float(last["ema20"])
+    ema50_v = float(last["ema50"])
+    rsi_v = float(last["rsi14"])
+    macd_h_v = float(last["macd_h"])
+    vwap_v = float(last["vwap"]) if pd.notna(last["vwap"]) else np.nan
+
+    vol = float(last["volume"])
+    vol_ma20 = float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0.0
+    vol_ratio = (vol / vol_ma20) if vol_ma20 > 0 else 0.0
+
+    uptrend = (price > ema50_v) and (ema20_v > ema50_v)
+
+    lb = CONFIG["breakout_lookback_hours"]
+    prior_high = np.nan
+    dist_to_high = np.nan
+    if len(df) > lb + 2:
+        prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
+        dist_to_high = (prior_high - price) / prior_high  # smaller is closer
+
+    dist_vwap = (price - vwap_v) / vwap_v if (not np.isnan(vwap_v) and vwap_v > 0) else np.nan
+
+    # Score: higher = more "interesting"
+    score = 0.0
+    score += 2.0 if uptrend else 0.0
+    score += min(max(vol_ratio, 0.0), 5.0) * 0.6
+    score += 1.0 if macd_h_v > 0 else 0.0
+
+    # RSI contribution peaks around 65
+    if 40 <= rsi_v <= 80:
+        score += (1.0 - abs(rsi_v - 65) / 25.0)  # ~1 at 65, declines away
+
+    # Breakout proximity bump (within ~3% matters)
+    if not np.isnan(dist_to_high):
+        score += max(0.0, 1.2 - (dist_to_high * 40.0))
+
+    return {
+        "price": round(price, 2),
+        "uptrend": bool(uptrend),
+        "rsi": round(rsi_v, 1),
+        "macd_h": round(macd_h_v, 4),
+        "vol_ratio": round(vol_ratio, 2),
+        "dist_to_high_pct": round(dist_to_high * 100, 2) if not np.isnan(dist_to_high) else None,
+        "dist_to_vwap_pct": round(dist_vwap * 100, 2) if not np.isnan(dist_vwap) else None,
+        "score": round(score, 3),
+    }
+
+
+# ---------------------------
 # Signal detection
 # ---------------------------
 
-def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[Dict]:
+def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple[List[Dict], Optional[Dict]]:
     df = get_hourly_bars(data_client, symbol)
     if df is None or len(df) < CONFIG["min_bars_required"]:
-        return []
+        return [], None
 
     # indicators
     df["ema20"] = ema(df["close"], CONFIG["ema_fast"])
@@ -322,12 +376,11 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[
     last = df.iloc[-1]
     price = float(last["close"])
     if price < CONFIG["min_price"]:
-        return []
+        return [], None
 
-    # liquidity filter
     avg_dollar_vol_20h = float((df["volume"].tail(20) * df["close"].tail(20)).mean())
     if avg_dollar_vol_20h < CONFIG["min_avg_dollar_vol_20h"]:
-        return []
+        return [], None
 
     ema20_v = float(last["ema20"])
     ema50_v = float(last["ema50"])
@@ -336,13 +389,11 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[
     atr_v = float(last["atr14"]) if pd.notna(last["atr14"]) else np.nan
     vwap_v = float(last["vwap"]) if pd.notna(last["vwap"]) else np.nan
 
-    # common rules
     uptrend = (price > ema50_v) and (ema20_v > ema50_v)
     momentum_ok = (CONFIG["rsi_min"] <= rsi_v <= CONFIG["rsi_max"])
     if CONFIG["require_macd_hist_positive"]:
         momentum_ok = momentum_ok and (macd_h_v > 0)
 
-    # volume ratio
     vol = float(last["volume"])
     vol_ma20 = float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0.0
     vol_ratio = (vol / vol_ma20) if vol_ma20 > 0 else 0.0
@@ -350,13 +401,15 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[
     now_ts = str(df.index[-1])
     alerts: List[Dict] = []
 
+    # Candidate snapshot (always)
+    cand = score_candidate(df)
+
     # --- BREAKOUT ---
     lb = CONFIG["breakout_lookback_hours"]
     if len(df) > lb + 2:
-        prior_high = float(df["high"].iloc[-(lb + 1):-1].max())  # exclude current bar
+        prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
         near = ((prior_high - price) / prior_high) <= CONFIG["breakout_near_pct"]
         broke = price > prior_high
-
         if uptrend and momentum_ok and (near or broke) and (vol_ratio >= CONFIG["volume_ratio_min"]):
             trigger = prior_high * (1 + CONFIG["breakout_buffer_pct"])
             entry = trigger
@@ -396,8 +449,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[
     # --- MEAN REVERSION UP ---
     if not np.isnan(vwap_v) and vwap_v > 0:
         dist_vwap = (price - vwap_v) / vwap_v
-        upper_w, lower_w = wick_body_ratios(last)
-
+        _, lower_w = wick_body_ratios(last)
         if (dist_vwap <= -CONFIG["vwap_far_pct"]) and (lower_w >= CONFIG["reversal_wick_ratio_min"]):
             entry = price
             target = entry * (1 + CONFIG["target_pct"])
@@ -414,55 +466,90 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> List[
                 "notes": f"{dist_vwap*100:.2f}% below VWAP; lower/body={lower_w:.2f}"
             })
 
-    return alerts
+    return alerts, cand
 
 
 # ---------------------------
-# Scan runner
+# Scan runner (ALWAYS emails summary + candidates)
 # ---------------------------
 
 def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClient, universe: List[str]) -> None:
+    start = time.time()
     ts = dt.datetime.now().isoformat(timespec="seconds")
     print(f"\n[{ts}] Scanning {len(universe)} symbols (1H)...")
 
     all_alerts: List[Dict] = []
+    candidates: List[Dict] = []
+    errors = 0
 
     for i, sym in enumerate(universe, 1):
         try:
-            alerts = analyze_symbol(data_client, sym)
+            alerts, cand = analyze_symbol(data_client, sym)
+
+            if cand is not None:
+                candidates.append({"symbol": sym, **cand})
+
             if alerts:
                 all_alerts.extend(alerts)
                 for a in alerts:
                     print(f"ALERT {a['alert_type']}: {a['symbol']} price={a['price']} entry={a['entry_trigger']} target={a['target_10pct']}")
+
         except Exception as e:
-            # show errors in logs (don’t hide issues)
+            errors += 1
             print(f"ERROR {sym}: {e}")
 
-        # small throttle
-        if i % 200 == 0:
-            time.sleep(0.5)
+        if CONFIG["throttle_every"] and i % int(CONFIG["throttle_every"]) == 0:
+            time.sleep(float(CONFIG["throttle_sleep"]))
 
-    if not all_alerts:
-        print("No alerts this scan.")
-        return
+    runtime_sec = round(time.time() - start, 2)
 
+    # Log alerts (only)
     append_alerts_csv(all_alerts, CONFIG["alerts_csv"])
 
-    # Email summary
-    lines = []
-    for a in all_alerts[:70]:
-        lines.append(
-            f"{a['alert_type']} {a['symbol']} | price={a['price']} | entry={a['entry_trigger']} | "
-            f"target10={a['target_10pct']} | stop={a.get('stop_atr')} | volR={a.get('vol_ratio')} | {a.get('notes','')}"
-        )
+    # Rank candidates and take top N
+    top = []
+    if candidates:
+        cdf = pd.DataFrame(candidates).sort_values("score", ascending=False).head(int(CONFIG["top_candidates_n"]))
+        top = cdf.to_dict(orient="records")
+
+    # Build email body (ALWAYS)
+    lines: List[str] = []
+    lines.append(f"Scan time: {ts}")
+    lines.append(f"Universe scanned: {len(universe)}")
+    lines.append(f"Runtime: {runtime_sec}s")
+    lines.append(f"Errors: {errors}")
+    lines.append(f"Alerts found: {len(all_alerts)}")
+    lines.append("")
+
+    if all_alerts:
+        lines.append("=== ALERTS (triggered) ===")
+        for a in all_alerts[:60]:
+            lines.append(
+                f"{a['alert_type']} {a['symbol']} | price={a['price']} | entry={a['entry_trigger']} | "
+                f"target10={a['target_10pct']} | stop={a.get('stop_atr')} | volR={a.get('vol_ratio')} | {a.get('notes','')}"
+            )
+        lines.append("")
+
+    lines.append(f"=== TOP {CONFIG['top_candidates_n']} CANDIDATES (ranked watchlist) ===")
+    if top:
+        for c in top:
+            lines.append(
+                f"{c['symbol']} | score={c['score']} | price={c['price']} | uptrend={c['uptrend']} | "
+                f"RSI={c['rsi']} | MACDh={c['macd_h']} | volR={c['vol_ratio']} | "
+                f"distHigh%={c.get('dist_to_high_pct')} | distVWAP%={c.get('dist_to_vwap_pct')}"
+            )
+    else:
+        lines.append("No candidates captured (filters too strict or insufficient bars/data).")
+
     body = "\n".join(lines)
-    send_email(subject=f"Alpaca Screener Alerts ({len(all_alerts)})", body=body)
+    send_email(subject=f"Hourly Screener Summary (alerts={len(all_alerts)})", body=body)
 
-    # Optional SMS ping
-    send_sms_twilio(body=f"Alpaca screener: {len(all_alerts)} alerts. Check email/CSV.")
+    # Optional SMS only if alerts exist (avoid spam)
+    if all_alerts:
+        send_sms_twilio(body=f"Alpaca screener: {len(all_alerts)} alerts. Check email.")
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="Run one scan and exit (best for cloud schedulers)")
     args = ap.parse_args()
@@ -475,9 +562,10 @@ def main():
         run_scan(data_client, trading_client, universe)
         return
 
-    schedule.every(CONFIG["scan_interval_minutes"]).minutes.do(
+    schedule.every(int(CONFIG["scan_interval_minutes"])).minutes.do(
         run_scan, data_client=data_client, trading_client=trading_client, universe=universe
     )
+
     run_scan(data_client, trading_client, universe)
 
     while True:
