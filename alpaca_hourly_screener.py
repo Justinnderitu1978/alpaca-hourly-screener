@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """
-alpaca_hourly_screener.py (ALPACA universe + IEX feed + ALWAYS emails a list)
+alpaca_hourly_screener.py (ALPACA universe + IEX feed + ALWAYS emails a list + EMAIL FAILURES NON-FATAL)
 
-What it does
-- Runs every hour (or once with --once)
-- Universe: ALL tradable US equities from Alpaca assets (NO Wikipedia)
-- Best-effort excludes ETFs using asset name hints + symbol suffix filters
-- Pulls 1H bars from Alpaca (forces IEX feed for Alpaca Free)
-- Computes: EMA20/EMA50, RSI14, MACD histogram, rolling VWAP, ATR14, vol ratio
-- Generates alerts:
-    * BREAKOUT
-    * TREND_PULLBACK
-    * MEAN_REVERSION_UP
-- ALWAYS sends an email summary:
-    * Alert list (if any)
-    * Top 25 ranked candidates (even if 0 alerts)
-- Logs alerts to CSV
+Key fixes included:
+✅ NO Wikipedia scraping (no 403)
+✅ Universe from Alpaca assets (best-effort ETF exclusion)
+✅ Alpaca Free compatible (forces DataFeed.IEX)
+✅ ALWAYS builds an email summary with Top Candidates (even if 0 alerts)
+✅ Email sending is NON-FATAL (SMTP timeouts won’t fail the GitHub Action)
+✅ Clear log lines so you can confirm email attempt/errors in Actions logs
 
 Required env vars (GitHub secrets):
   APCA_API_KEY_ID
   APCA_API_SECRET_KEY
 
-Email env vars (GitHub secrets) to receive summaries:
+Email env vars (optional, GitHub secrets):
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_TO_EMAIL
 
 Optional Twilio env vars:
@@ -67,7 +60,7 @@ CONFIG = {
     "min_bars_required": 140,       # enough for indicators + lookbacks
 
     # Universe/runtime safety
-    "max_symbols_per_run": 1200,    # reduce/increase depending on runtime
+    "max_symbols_per_run": 1200,    # reduce if Actions runtime is too long
     "throttle_every": 200,
     "throttle_sleep": 0.5,
 
@@ -106,6 +99,9 @@ CONFIG = {
     # Output
     "alerts_csv": "alerts_log.csv",
     "top_candidates_n": 25,
+
+    # Email network timeout (seconds)
+    "smtp_timeout": 20,
 }
 
 
@@ -156,21 +152,24 @@ def wick_body_ratios(row: pd.Series) -> Tuple[float, float]:
 
 def send_email(subject: str, body: str) -> None:
     host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
+    port_raw = os.getenv("SMTP_PORT")
     user = os.getenv("SMTP_USER")
     pwd = os.getenv("SMTP_PASS")
     to_email = os.getenv("ALERT_TO_EMAIL")
 
-    if not all([host, user, pwd, to_email]):
+    if not all([host, port_raw, user, pwd, to_email]):
         print("Email skipped (SMTP secrets missing).")
         return
+
+    port = int(port_raw)
 
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = to_email
 
-    with smtplib.SMTP(host, port) as s:
+    # IMPORTANT: add timeout so it doesn't hang forever
+    with smtplib.SMTP(host, port, timeout=int(CONFIG["smtp_timeout"])) as s:
         s.starttls()
         s.login(user, pwd)
         s.sendmail(user, [to_email], msg.as_string())
@@ -210,12 +209,12 @@ def make_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
     if not key or not secret:
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY secrets.")
     data_client = StockHistoricalDataClient(key, secret)
-    trading_client = TradingClient(key, secret, paper=True)  # use paper keys
+    trading_client = TradingClient(key, secret, paper=True)  # uses PAPER keys
     return data_client, trading_client
 
 
 # ---------------------------
-# Universe: Alpaca assets
+# Universe: Alpaca assets (best-effort ETF exclusion)
 # ---------------------------
 
 ETF_NAME_HINTS = [
@@ -243,7 +242,6 @@ def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
         if not sym:
             continue
 
-        # exclude symbols with odd chars
         if any(ch in sym for ch in ["^", "/", " "]):
             continue
 
@@ -289,7 +287,6 @@ def get_hourly_bars(data_client: StockHistoricalDataClient, symbol: str) -> Opti
         df = df.xs(symbol, level=0)
 
     df = df.sort_index().dropna()
-
     needed = {"open", "high", "low", "close", "volume"}
     if not needed.issubset(set(df.columns)):
         return None
@@ -321,25 +318,21 @@ def score_candidate(df: pd.DataFrame) -> Optional[Dict]:
     uptrend = (price > ema50_v) and (ema20_v > ema50_v)
 
     lb = CONFIG["breakout_lookback_hours"]
-    prior_high = np.nan
     dist_to_high = np.nan
     if len(df) > lb + 2:
         prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
-        dist_to_high = (prior_high - price) / prior_high  # smaller is closer
+        dist_to_high = (prior_high - price) / prior_high
 
     dist_vwap = (price - vwap_v) / vwap_v if (not np.isnan(vwap_v) and vwap_v > 0) else np.nan
 
-    # Score: higher = more "interesting"
     score = 0.0
     score += 2.0 if uptrend else 0.0
     score += min(max(vol_ratio, 0.0), 5.0) * 0.6
     score += 1.0 if macd_h_v > 0 else 0.0
 
-    # RSI contribution peaks around 65
     if 40 <= rsi_v <= 80:
-        score += (1.0 - abs(rsi_v - 65) / 25.0)  # ~1 at 65, declines away
+        score += (1.0 - abs(rsi_v - 65) / 25.0)
 
-    # Breakout proximity bump (within ~3% matters)
     if not np.isnan(dist_to_high):
         score += max(0.0, 1.2 - (dist_to_high * 40.0))
 
@@ -364,7 +357,6 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
     if df is None or len(df) < CONFIG["min_bars_required"]:
         return [], None
 
-    # indicators
     df["ema20"] = ema(df["close"], CONFIG["ema_fast"])
     df["ema50"] = ema(df["close"], CONFIG["ema_slow"])
     df["rsi14"] = rsi(df["close"], CONFIG["rsi_period"])
@@ -401,10 +393,9 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
     now_ts = str(df.index[-1])
     alerts: List[Dict] = []
 
-    # Candidate snapshot (always)
     cand = score_candidate(df)
 
-    # --- BREAKOUT ---
+    # BREAKOUT
     lb = CONFIG["breakout_lookback_hours"]
     if len(df) > lb + 2:
         prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
@@ -427,7 +418,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
                 "notes": f"prior {lb}h high={prior_high:.2f}"
             })
 
-    # --- TREND PULLBACK ---
+    # TREND PULLBACK
     dist_ema20 = abs(price - ema20_v) / ema20_v if ema20_v else 1.0
     green = float(last["close"]) > float(last["open"])
     if uptrend and momentum_ok and (dist_ema20 <= CONFIG["pullback_near_ema_pct"]) and (not CONFIG["require_green_candle"] or green):
@@ -446,7 +437,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
             "notes": f"near EMA20 ({dist_ema20*100:.2f}%)"
         })
 
-    # --- MEAN REVERSION UP ---
+    # MEAN REVERSION UP
     if not np.isnan(vwap_v) and vwap_v > 0:
         dist_vwap = (price - vwap_v) / vwap_v
         _, lower_w = wick_body_ratios(last)
@@ -470,7 +461,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
 
 
 # ---------------------------
-# Scan runner (ALWAYS emails summary + candidates)
+# Scan runner (ALWAYS emails; EMAIL FAILURES NON-FATAL)
 # ---------------------------
 
 def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClient, universe: List[str]) -> None:
@@ -503,16 +494,16 @@ def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClie
 
     runtime_sec = round(time.time() - start, 2)
 
-    # Log alerts (only)
+    # Log alerts
     append_alerts_csv(all_alerts, CONFIG["alerts_csv"])
 
-    # Rank candidates and take top N
+    # Rank candidates
     top = []
     if candidates:
         cdf = pd.DataFrame(candidates).sort_values("score", ascending=False).head(int(CONFIG["top_candidates_n"]))
         top = cdf.to_dict(orient="records")
 
-    # Build email body (ALWAYS)
+    # Build summary
     lines: List[str] = []
     lines.append(f"Scan time: {ts}")
     lines.append(f"Universe scanned: {len(universe)}")
@@ -542,11 +533,20 @@ def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClie
         lines.append("No candidates captured (filters too strict or insufficient bars/data).")
 
     body = "\n".join(lines)
-    send_email(subject=f"Hourly Screener Summary (alerts={len(all_alerts)})", body=body)
 
-    # Optional SMS only if alerts exist (avoid spam)
-    if all_alerts:
-        send_sms_twilio(body=f"Alpaca screener: {len(all_alerts)} alerts. Check email.")
+    # ✅ NON-FATAL EMAIL SEND
+    try:
+        send_email(subject=f"Hourly Screener Summary (alerts={len(all_alerts)})", body=body)
+        print("Email summary attempted.")
+    except Exception as e:
+        print(f"EMAIL ERROR (non-fatal): {e}")
+
+    # Optional SMS only if alerts exist
+    try:
+        if all_alerts:
+            send_sms_twilio(body=f"Alpaca screener: {len(all_alerts)} alerts. Check email.")
+    except Exception as e:
+        print(f"SMS ERROR (non-fatal): {e}")
 
 
 def main() -> None:
