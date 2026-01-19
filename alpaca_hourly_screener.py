@@ -199,7 +199,7 @@ def make_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
     if not key or not secret:
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY secrets.")
     data_client = StockHistoricalDataClient(key, secret)
-    trading_client = TradingClient(key, secret, paper=True)  # Paper keys
+    trading_client = TradingClient(key, secret, paper=True)
     return data_client, trading_client
 
 
@@ -225,21 +225,16 @@ def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
     for a in assets:
         if not getattr(a, "tradable", False):
             continue
-
         sym = getattr(a, "symbol", None)
         if not sym:
             continue
-
         if any(ch in sym for ch in ["^", "/", " "]):
             continue
-
         if sym.endswith(("W", "WS", "R", "U")):
             continue
-
         name = getattr(a, "name", "") or ""
         if looks_like_etf(name):
             continue
-
         universe.append(sym)
 
     universe = sorted(set(universe))
@@ -367,7 +362,6 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
 
     now_ts = str(df.index[-1])
     alerts: List[Dict] = []
-
     cand = score_candidate(df)
 
     lb = CONFIG["breakout_lookback_hours"]
@@ -376,8 +370,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
         near = ((prior_high - price) / prior_high) <= CONFIG["breakout_near_pct"]
         broke = price > prior_high
         if uptrend and momentum_ok and (near or broke) and (vol_ratio >= CONFIG["volume_ratio_min"]):
-            trigger = prior_high * (1 + CONFIG["breakout_buffer_pct"])
-            entry = trigger
+            entry = prior_high * (1 + CONFIG["breakout_buffer_pct"])
             target = entry * (1 + CONFIG["target_pct"])
             stop = (entry - CONFIG["stop_atr_mult"] * atr_v) if not np.isnan(atr_v) else None
             alerts.append({
@@ -496,10 +489,11 @@ def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClie
 
     body = "\n".join(lines)
 
-    # Non-fatal notifications
+    # Always attempt email; never fail the job due to email
     send_email(subject=f"Hourly Screener Summary (alerts={len(all_alerts)})", body=body)
     print("Email summary attempted.")
 
+    # Optional SMS only if alerts exist
     if all_alerts:
         send_sms_twilio(body=f"Alpaca screener: {len(all_alerts)} alerts. Check email.")
 
