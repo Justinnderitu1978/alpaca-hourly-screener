@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
 """
-alpaca_hourly_screener.py (ALPACA universe + IEX feed + ALWAYS emails a list + EMAIL FAILURES NON-FATAL)
+alpaca_hourly_screener.py (CORRECTED VERSION)
 
-What it does
-- Runs every hour (or once with --once)
-- Universe: ALL tradable US equities from Alpaca assets (NO Wikipedia)
-- Best-effort excludes ETFs using asset name hints + symbol suffix filters
-- Pulls 1H bars from Alpaca (forces IEX feed for Alpaca Free)
-- Computes: EMA20/EMA50, RSI14, MACD histogram, rolling VWAP, ATR14, vol ratio
-- Generates alerts:
-    * BREAKOUT
-    * TREND_PULLBACK
-    * MEAN_REVERSION_UP
-- ALWAYS builds an email summary:
-    * Alert list (if any)
-    * Top 25 ranked candidates (even if 0 alerts)
-- Logs alerts to CSV
-- IMPORTANT: Email/SMS errors do NOT fail the GitHub Action
-
-Required GitHub Secrets:
-  APCA_API_KEY_ID
-  APCA_API_SECRET_KEY
-
-Email Secrets (optional):
-  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_TO_EMAIL
-
-Optional Twilio Secrets:
-  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, TWILIO_TO
+Key fixes applied:
+1. Fixed stock-split symbol filter (removed "R" which is valid for NYSE)
+2. Added proper datetime range for bar requests (avoids getting insufficient data)
+3. Fixed NaN handling in calculations
+4. Added validation for empty/invalid indicator values
+5. Improved error handling for missing data
+6. Fixed potential division-by-zero issues
+7. Added better ETF detection patterns
+8. Fixed breakout logic edge case when prior_high equals current price
 """
 
 from __future__ import annotations
@@ -98,18 +82,23 @@ CONFIG = {
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
+    """Calculate Exponential Moving Average"""
     return series.ewm(span=span, adjust=False).mean()
 
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Calculate Relative Strength Index"""
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
+    # FIX: Handle division by zero more gracefully
     rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi_vals = 100 - (100 / (1 + rs))
+    return rsi_vals.fillna(50)  # Neutral RSI for undefined values
 
 
 def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    """Calculate MACD Histogram"""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -118,6 +107,7 @@ def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9)
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Average True Range"""
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
@@ -125,21 +115,28 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def vwap_rolling(df: pd.DataFrame, lookback: int) -> pd.Series:
+    """Calculate rolling Volume Weighted Average Price"""
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = tp * df["volume"]
-    return pv.rolling(lookback).sum() / df["volume"].rolling(lookback).sum()
+    # FIX: Handle zero volume periods
+    vol_sum = df["volume"].rolling(lookback).sum()
+    pv_sum = pv.rolling(lookback).sum()
+    return pv_sum / vol_sum.replace(0, np.nan)
 
 
 def wick_body_ratios(row: pd.Series) -> Tuple[float, float]:
+    """Calculate upper and lower wick to body ratios"""
     o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
     body = abs(c - o)
     upper = h - max(o, c)
     lower = min(o, c) - l
-    body = body if body > 1e-9 else 1e-9
+    # FIX: Better minimum body threshold
+    body = max(body, 1e-6)
     return upper / body, lower / body
 
 
 def send_email(subject: str, body: str) -> None:
+    """Send email alert (non-fatal on error)"""
     host = os.getenv("SMTP_HOST")
     port_raw = os.getenv("SMTP_PORT")
     user = os.getenv("SMTP_USER")
@@ -170,6 +167,7 @@ def send_email(subject: str, body: str) -> None:
 
 
 def send_sms_twilio(body: str) -> None:
+    """Send SMS via Twilio (non-fatal on error)"""
     sid = os.getenv("TWILIO_ACCOUNT_SID")
     token = os.getenv("TWILIO_AUTH_TOKEN")
     from_ = os.getenv("TWILIO_FROM")
@@ -186,6 +184,7 @@ def send_sms_twilio(body: str) -> None:
 
 
 def append_alerts_csv(alerts: List[Dict], path: str) -> None:
+    """Append alerts to CSV log"""
     if not alerts:
         return
     df = pd.DataFrame(alerts)
@@ -194,6 +193,7 @@ def append_alerts_csv(alerts: List[Dict], path: str) -> None:
 
 
 def make_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
+    """Initialize Alpaca API clients"""
     key = os.getenv("APCA_API_KEY_ID")
     secret = os.getenv("APCA_API_SECRET_KEY")
     if not key or not secret:
@@ -203,13 +203,16 @@ def make_clients() -> Tuple[StockHistoricalDataClient, TradingClient]:
     return data_client, trading_client
 
 
+# FIX: Expanded ETF detection
 ETF_NAME_HINTS = [
     " ETF", "TRUST", "FUND", "INDEX", "SPDR", "ISHARES", "VANGUARD", "INVESCO",
     "PROSHARES", "WISDOMTREE", "VANECK", "DIREXION", "GLOBAL X", "ARK",
+    "FIRST TRUST", "GRANITESHARES", "AMPLIFY", "PACER", "ROUNDHILL"
 ]
 
 
 def looks_like_etf(name: str) -> bool:
+    """Check if asset name suggests it's an ETF"""
     if not name:
         return False
     u = name.upper()
@@ -219,6 +222,7 @@ def looks_like_etf(name: str) -> bool:
 
 
 def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
+    """Build tradable stock universe from Alpaca assets"""
     assets = trading.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY))
     universe: List[str] = []
 
@@ -228,9 +232,12 @@ def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
         sym = getattr(a, "symbol", None)
         if not sym:
             continue
-        if any(ch in sym for ch in ["^", "/", " "]):
+        # Skip special characters
+        if any(ch in sym for ch in ["^", "/", " ", "."]):
             continue
-        if sym.endswith(("W", "WS", "R", "U")):
+        # FIX: Only filter warrants and units, NOT "R" (Royal Dutch, Ryder, etc. are valid)
+        # W/WS = Warrants, U = Units
+        if sym.endswith(("W", "WS", "U")):
             continue
         name = getattr(a, "name", "") or ""
         if looks_like_etf(name):
@@ -245,13 +252,27 @@ def build_universe_from_alpaca(trading: TradingClient) -> List[str]:
 
 
 def get_hourly_bars(data_client: StockHistoricalDataClient, symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch hourly bars for a symbol with proper date range"""
+    # FIX: Specify explicit date range to ensure we get enough data
+    end = dt.datetime.now(dt.timezone.utc)
+    # Request ~90 days of data to ensure we get enough hourly bars after market hours filtering
+    start = end - dt.timedelta(days=90)
+    
     req = StockBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=CONFIG["bars_timeframe"],
+        start=start,
+        end=end,
         limit=CONFIG["bars_limit"],
         feed=DataFeed.IEX,
     )
-    bars = data_client.get_stock_bars(req)
+    
+    try:
+        bars = data_client.get_stock_bars(req)
+    except Exception as e:
+        print(f"API error fetching {symbol}: {e}")
+        return None
+        
     if bars is None:
         return None
 
@@ -273,31 +294,43 @@ def get_hourly_bars(data_client: StockHistoricalDataClient, symbol: str) -> Opti
 
 
 def score_candidate(df: pd.DataFrame) -> Optional[Dict]:
+    """Score a candidate for ranking in watchlist"""
     if df is None or df.empty:
         return None
 
     last = df.iloc[-1]
+    
+    # FIX: Validate all required indicators exist
+    required_cols = ["close", "ema20", "ema50", "rsi14", "macd_h", "vwap", "volume", "vol_ma20"]
+    if not all(col in df.columns for col in required_cols):
+        return None
+    
     price = float(last["close"])
-
-    ema20_v = float(last["ema20"])
-    ema50_v = float(last["ema50"])
-    rsi_v = float(last["rsi14"])
-    macd_h_v = float(last["macd_h"])
+    ema20_v = float(last["ema20"]) if pd.notna(last["ema20"]) else np.nan
+    ema50_v = float(last["ema50"]) if pd.notna(last["ema50"]) else np.nan
+    rsi_v = float(last["rsi14"]) if pd.notna(last["rsi14"]) else 50.0
+    macd_h_v = float(last["macd_h"]) if pd.notna(last["macd_h"]) else 0.0
     vwap_v = float(last["vwap"]) if pd.notna(last["vwap"]) else np.nan
 
     vol = float(last["volume"])
     vol_ma20 = float(last["vol_ma20"]) if pd.notna(last["vol_ma20"]) else 0.0
     vol_ratio = (vol / vol_ma20) if vol_ma20 > 0 else 0.0
 
-    uptrend = (price > ema50_v) and (ema20_v > ema50_v)
+    # FIX: Handle NaN in uptrend calculation
+    uptrend = False
+    if not np.isnan(ema20_v) and not np.isnan(ema50_v) and ema50_v > 0:
+        uptrend = (price > ema50_v) and (ema20_v > ema50_v)
 
     lb = CONFIG["breakout_lookback_hours"]
     dist_to_high = np.nan
     if len(df) > lb + 2:
         prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
-        dist_to_high = (prior_high - price) / prior_high
+        if prior_high > 0:
+            dist_to_high = (prior_high - price) / prior_high
 
-    dist_vwap = (price - vwap_v) / vwap_v if (not np.isnan(vwap_v) and vwap_v > 0) else np.nan
+    dist_vwap = np.nan
+    if not np.isnan(vwap_v) and vwap_v > 0:
+        dist_vwap = (price - vwap_v) / vwap_v
 
     score = 0.0
     score += 2.0 if uptrend else 0.0
@@ -323,10 +356,12 @@ def score_candidate(df: pd.DataFrame) -> Optional[Dict]:
 
 
 def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple[List[Dict], Optional[Dict]]:
+    """Analyze a single symbol for alerts and scoring"""
     df = get_hourly_bars(data_client, symbol)
     if df is None or len(df) < CONFIG["min_bars_required"]:
         return [], None
 
+    # Calculate all indicators
     df["ema20"] = ema(df["close"], CONFIG["ema_fast"])
     df["ema50"] = ema(df["close"], CONFIG["ema_slow"])
     df["rsi14"] = rsi(df["close"], CONFIG["rsi_period"])
@@ -337,19 +372,27 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
 
     last = df.iloc[-1]
     price = float(last["close"])
+    
+    # Price filter
     if price < CONFIG["min_price"]:
         return [], None
 
+    # Volume filter
     avg_dollar_vol_20h = float((df["volume"].tail(20) * df["close"].tail(20)).mean())
     if avg_dollar_vol_20h < CONFIG["min_avg_dollar_vol_20h"]:
         return [], None
 
-    ema20_v = float(last["ema20"])
-    ema50_v = float(last["ema50"])
-    rsi_v = float(last["rsi14"])
-    macd_h_v = float(last["macd_h"])
+    # FIX: Validate indicators before using
+    ema20_v = float(last["ema20"]) if pd.notna(last["ema20"]) else np.nan
+    ema50_v = float(last["ema50"]) if pd.notna(last["ema50"]) else np.nan
+    rsi_v = float(last["rsi14"]) if pd.notna(last["rsi14"]) else 50.0
+    macd_h_v = float(last["macd_h"]) if pd.notna(last["macd_h"]) else 0.0
     atr_v = float(last["atr14"]) if pd.notna(last["atr14"]) else np.nan
     vwap_v = float(last["vwap"]) if pd.notna(last["vwap"]) else np.nan
+
+    # Check for invalid indicators
+    if np.isnan(ema20_v) or np.isnan(ema50_v) or ema50_v == 0:
+        return [], None
 
     uptrend = (price > ema50_v) and (ema20_v > ema50_v)
     momentum_ok = (CONFIG["rsi_min"] <= rsi_v <= CONFIG["rsi_max"])
@@ -364,28 +407,32 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
     alerts: List[Dict] = []
     cand = score_candidate(df)
 
+    # BREAKOUT ALERT
     lb = CONFIG["breakout_lookback_hours"]
     if len(df) > lb + 2:
         prior_high = float(df["high"].iloc[-(lb + 1):-1].max())
-        near = ((prior_high - price) / prior_high) <= CONFIG["breakout_near_pct"]
-        broke = price > prior_high
-        if uptrend and momentum_ok and (near or broke) and (vol_ratio >= CONFIG["volume_ratio_min"]):
-            entry = prior_high * (1 + CONFIG["breakout_buffer_pct"])
-            target = entry * (1 + CONFIG["target_pct"])
-            stop = (entry - CONFIG["stop_atr_mult"] * atr_v) if not np.isnan(atr_v) else None
-            alerts.append({
-                "timestamp": now_ts,
-                "symbol": symbol,
-                "alert_type": "BREAKOUT",
-                "price": round(price, 4),
-                "entry_trigger": round(entry, 4),
-                "target_10pct": round(target, 4),
-                "stop_atr": round(stop, 4) if stop else None,
-                "vol_ratio": round(vol_ratio, 2),
-                "notes": f"prior {lb}h high={prior_high:.2f}"
-            })
+        # FIX: Handle edge case where prior_high could be zero or equal to current price
+        if prior_high > 0:
+            near = ((prior_high - price) / prior_high) <= CONFIG["breakout_near_pct"]
+            broke = price > prior_high * (1.0001)  # FIX: Require actual breakout, not just equal
+            if uptrend and momentum_ok and (near or broke) and (vol_ratio >= CONFIG["volume_ratio_min"]):
+                entry = prior_high * (1 + CONFIG["breakout_buffer_pct"])
+                target = entry * (1 + CONFIG["target_pct"])
+                stop = (entry - CONFIG["stop_atr_mult"] * atr_v) if not np.isnan(atr_v) else None
+                alerts.append({
+                    "timestamp": now_ts,
+                    "symbol": symbol,
+                    "alert_type": "BREAKOUT",
+                    "price": round(price, 4),
+                    "entry_trigger": round(entry, 4),
+                    "target_10pct": round(target, 4),
+                    "stop_atr": round(stop, 4) if stop else None,
+                    "vol_ratio": round(vol_ratio, 2),
+                    "notes": f"prior {lb}h high={prior_high:.2f}"
+                })
 
-    dist_ema20 = abs(price - ema20_v) / ema20_v if ema20_v else 1.0
+    # TREND PULLBACK ALERT
+    dist_ema20 = abs(price - ema20_v) / ema20_v if ema20_v > 0 else 1.0
     green = float(last["close"]) > float(last["open"])
     if uptrend and momentum_ok and (dist_ema20 <= CONFIG["pullback_near_ema_pct"]) and (not CONFIG["require_green_candle"] or green):
         entry = price
@@ -403,6 +450,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
             "notes": f"near EMA20 ({dist_ema20*100:.2f}%)"
         })
 
+    # MEAN REVERSION ALERT
     if not np.isnan(vwap_v) and vwap_v > 0:
         dist_vwap = (price - vwap_v) / vwap_v
         _, lower_w = wick_body_ratios(last)
@@ -426,6 +474,7 @@ def analyze_symbol(data_client: StockHistoricalDataClient, symbol: str) -> Tuple
 
 
 def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClient, universe: List[str]) -> None:
+    """Execute main scanning routine"""
     start = time.time()
     ts = dt.datetime.now().isoformat(timespec="seconds")
     print(f"\n[{ts}] Scanning {len(universe)} symbols (1H)...")
@@ -499,6 +548,7 @@ def run_scan(data_client: StockHistoricalDataClient, trading_client: TradingClie
 
 
 def main() -> None:
+    """Main entry point"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="Run one scan and exit (best for cloud schedulers)")
     args = ap.parse_args()
@@ -524,3 +574,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
